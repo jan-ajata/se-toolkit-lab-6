@@ -2,10 +2,12 @@
 
 These tests run agent.py as a subprocess and verify:
 1. The output is valid JSON
-2. Required fields (answer, tool_calls) are present
+2. Required fields (answer, source, tool_calls) are present
 3. The answer is non-empty
+4. Tool calls are populated when tools are used
+5. Source field correctly identifies wiki sections
 
-Run with: uv run pytest backend/tests/unit/test_agent.py -v
+Run with: uv run pytest test_agent.py -v
 
 Note: These tests require a valid LLM API configuration in .env.agent.secret.
 """
@@ -18,8 +20,8 @@ from pathlib import Path
 import pytest
 
 
-# Path to agent.py in project root
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+# Path to agent.py in project root (same directory as this test file)
+PROJECT_ROOT = Path(__file__).parent
 AGENT_PATH = PROJECT_ROOT / "agent.py"
 
 
@@ -82,3 +84,77 @@ class TestAgentOutput:
 
         assert "tool_calls" in data, "Missing 'tool_calls' field in output"
         assert isinstance(data["tool_calls"], list), "'tool_calls' should be an array"
+
+
+class TestDocumentationAgent:
+    """Test that agent.py correctly uses tools to answer wiki questions."""
+
+    @pytest.mark.asyncio
+    async def test_merge_conflict_uses_read_file(self):
+        """Test that agent uses read_file to answer merge conflict question.
+        
+        The agent should discover wiki files and read git-workflow.md or git-vscode.md
+        to find information about resolving merge conflicts.
+        """
+        result = subprocess.run(
+            [sys.executable, str(AGENT_PATH), "How do you resolve a merge conflict?"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, f"Agent exited with code {result.returncode}: {result.stderr}"
+
+        data = json.loads(result.stdout.strip())
+
+        # Check required fields
+        assert "answer" in data, "Missing 'answer' field"
+        assert "source" in data, "Missing 'source' field"
+        assert "tool_calls" in data, "Missing 'tool_calls' field"
+
+        # Check that tool_calls is populated
+        assert len(data["tool_calls"]) > 0, "Expected tool calls but got none"
+
+        # Check that read_file was used
+        tools_used = [call["tool"] for call in data["tool_calls"]]
+        assert "read_file" in tools_used, f"Expected read_file in tool calls, got: {tools_used}"
+
+        # Check that source references a wiki file
+        assert "wiki/" in data["source"], f"Source should reference wiki file, got: {data['source']}"
+
+    @pytest.mark.asyncio
+    async def test_wiki_files_uses_list_files(self):
+        """Test that agent uses list_files to discover wiki files.
+        
+        When asked about files in the wiki, the agent should use list_files
+        to discover what files exist.
+        """
+        result = subprocess.run(
+            [sys.executable, str(AGENT_PATH), "What files are in the wiki?"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, f"Agent exited with code {result.returncode}: {result.stderr}"
+
+        data = json.loads(result.stdout.strip())
+
+        # Check required fields
+        assert "answer" in data, "Missing 'answer' field"
+        assert "tool_calls" in data, "Missing 'tool_calls' field"
+
+        # Check that tool_calls is populated
+        assert len(data["tool_calls"]) > 0, "Expected tool calls but got none"
+
+        # Check that list_files was used
+        tools_used = [call["tool"] for call in data["tool_calls"]]
+        assert "list_files" in tools_used, f"Expected list_files in tool calls, got: {tools_used}"
+
+        # Check that the list_files result contains wiki files
+        for call in data["tool_calls"]:
+            if call["tool"] == "list_files" and call["args"].get("path") == "wiki":
+                assert "git" in call["result"].lower(), "list_files result should contain git files"
+                break
+        else:
+            pytest.fail("list_files with path 'wiki' was not called")
