@@ -20,22 +20,17 @@ from typing import Any
 import httpx
 
 # Maximum number of tool calls per question
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 20
 
 # Project root directory (where agent.py is located)
 PROJECT_ROOT = Path(__file__).parent.resolve()
 
 
-def load_env() -> dict[str, str]:
-    """Load environment variables from .env.agent.secret."""
-    env_file = Path(".env.agent.secret")
+def load_env_file(filepath: str) -> dict[str, str]:
+    """Load environment variables from a file."""
+    env_file = Path(filepath)
     if not env_file.exists():
-        print(f"Error: {env_file} not found", file=sys.stderr)
-        print(
-            "Copy .env.agent.example to .env.agent.secret and fill in your credentials",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        return {}
 
     env_vars: dict[str, str] = {}
     for line in env_file.read_text().splitlines():
@@ -51,6 +46,26 @@ def load_env() -> dict[str, str]:
             env_vars[key] = value
 
     return env_vars
+
+
+def load_env() -> dict[str, str]:
+    """Load environment variables from .env.agent.secret."""
+    env_vars = load_env_file(".env.agent.secret")
+    
+    if not env_vars:
+        print("Error: .env.agent.secret not found", file=sys.stderr)
+        print(
+            "Copy .env.agent.example to .env.agent.secret and fill in your credentials",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    return env_vars
+
+
+def load_docker_env() -> dict[str, str]:
+    """Load environment variables from .env.docker.secret."""
+    return load_env_file(".env.docker.secret")
 
 
 def get_llm_config(env_vars: dict[str, str]) -> tuple[str, str, str]:
@@ -70,6 +85,29 @@ def get_llm_config(env_vars: dict[str, str]) -> tuple[str, str, str]:
         sys.exit(1)
 
     return api_key, api_base, model
+
+
+def get_api_config(docker_env: dict[str, str]) -> tuple[str, str]:
+    """Extract API configuration for query_api tool.
+    
+    Returns (lms_api_key, agent_api_base_url).
+    """
+    lms_api_key = docker_env.get("LMS_API_KEY")
+    
+    # AGENT_API_BASE_URL can come from:
+    # 1. Environment variable (for autochecker) - highest priority
+    # 2. .env.docker.secret
+    # 3. Default: http://localhost:42001 (backend port)
+    agent_api_base = os.environ.get(
+        "AGENT_API_BASE_URL",
+        docker_env.get("AGENT_API_BASE_URL", "http://localhost:42001")
+    )
+
+    if not lms_api_key:
+        print("Error: LMS_API_KEY not set in .env.docker.secret", file=sys.stderr)
+        sys.exit(1)
+
+    return lms_api_key, agent_api_base
 
 
 def validate_path(path: str) -> Path:
@@ -149,10 +187,96 @@ def tool_list_files(path: str) -> str:
         return f"Error listing directory: {e}"
 
 
+def tool_query_api(method: str, path: str, body: str = None, auth: bool = True,
+                   lms_api_key: str = None, api_base_url: str = None) -> str:
+    """Call the backend API and return the response.
+
+    Args:
+        method: HTTP method (GET, POST, PUT, DELETE, etc.)
+        path: API path (e.g., '/items/', '/analytics/scores')
+        body: JSON request body (optional, for POST/PUT)
+        auth: Whether to include authentication header (default: True)
+        lms_api_key: API key for authentication (from env)
+        api_base_url: Base URL of the API (from env)
+
+    Returns:
+        JSON string with status_code and body, or error message.
+    """
+    # Use provided values or defaults
+    if lms_api_key is None:
+        docker_env = load_docker_env()
+        lms_api_key = docker_env.get("LMS_API_KEY", "")
+    
+    if api_base_url is None:
+        docker_env = load_docker_env()
+        api_base_url = os.environ.get(
+            "AGENT_API_BASE_URL",
+            docker_env.get("AGENT_API_BASE_URL", "http://localhost:42001")
+        )
+
+    if not lms_api_key:
+        return "Error: LMS_API_KEY not configured"
+
+    # Build URL
+    base = api_base_url.rstrip("/")
+    path = path.lstrip("/")
+    url = f"{base}/{path}"
+
+    # Build headers
+    headers = {
+        "Content-Type": "application/json",
+    }
+    
+    # Only add auth header if auth=True
+    if auth and lms_api_key:
+        headers["Authorization"] = f"Bearer {lms_api_key}"
+
+    print(f"Calling API: {method} {url} (auth={auth})", file=sys.stderr)
+
+    try:
+        # Make the request
+        if method.upper() == "GET":
+            response = httpx.get(url, headers=headers, timeout=30)
+        elif method.upper() == "POST":
+            data = json.loads(body) if body else {}
+            response = httpx.post(url, headers=headers, json=data, timeout=30)
+        elif method.upper() == "PUT":
+            data = json.loads(body) if body else {}
+            response = httpx.put(url, headers=headers, json=data, timeout=30)
+        elif method.upper() == "DELETE":
+            response = httpx.delete(url, headers=headers, timeout=30)
+        else:
+            return json.dumps({"error": f"Unsupported method '{method}'", "status_code": None})
+
+        # Build response
+        result = {
+            "status_code": response.status_code,
+            "body": response.text,
+        }
+
+        try:
+            result["body"] = response.json()
+        except json.JSONDecodeError:
+            result["body"] = response.text
+
+        return json.dumps(result)
+
+    except httpx.TimeoutException:
+        return json.dumps({"error": "Request timed out", "status_code": None})
+    except httpx.RequestError as e:
+        return json.dumps({"error": str(e), "status_code": None})
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"Invalid JSON in body: {e}", "status_code": None})
+    except Exception as e:
+        return json.dumps({"error": str(e), "status_code": None})
+
+
 # Map tool names to functions
+# Note: query_api needs special handling for env vars
 TOOLS_MAP = {
     "read_file": tool_read_file,
     "list_files": tool_list_files,
+    "query_api": tool_query_api,
 }
 
 
@@ -191,7 +315,7 @@ def call_llm(
     api_key: str,
     api_base: str,
     model: str,
-    timeout: int = 60
+    timeout: int = 120
 ) -> str:
     """Call the LLM API and return the response text.
 
@@ -300,31 +424,56 @@ def run_agentic_loop(
     api_key: str,
     api_base: str,
     model: str,
-    timeout: int = 60
+    lms_api_key: str,
+    api_base_url: str,
+    timeout: int = 120
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Run the agentic loop with tool calling via JSON parsing.
 
     Args:
         question: The user's question
-        api_key: API key for authentication
-        api_base: Base URL of the API
-        model: Model name to use
+        api_key: LLM API key for authentication
+        api_base: LLM API base URL
+        model: LLM model name to use
+        lms_api_key: Backend API key for query_api
+        api_base_url: Backend API base URL
         timeout: Request timeout in seconds
 
     Returns:
         Tuple of (answer, source, tool_calls)
     """
     # System prompt that instructs the LLM to use JSON for tool calls
-    system_prompt = """You are a documentation assistant with access to a project wiki.
-You have two tools:
-1. list_files - List files in a directory (use to discover wiki files)
-2. read_file - Read the contents of a file
+    system_prompt = """You are a documentation and system assistant with access to three tools.
+
+You have three tools:
+1. list_files - List files in a directory (use to discover wiki files or source code)
+   Args: {"path": "directory/path"}
+   Example: {"tool": "list_files", "args": {"path": "wiki"}}
+
+2. read_file - Read the contents of a file (wiki docs, source code, config files)
+   Args: {"path": "relative/path/to/file"}
+   Example: {"tool": "read_file", "args": {"path": "wiki/git-workflow.md"}}
+
+3. query_api - Call the running backend API (for data queries, status codes, errors)
+   Args: {"method": "GET|POST|PUT|DELETE", "path": "/api/endpoint", "body": "json_string", "auth": true|false}
+   Example: {"tool": "query_api", "args": {"method": "GET", "path": "/items/"}}
+   Example: {"tool": "query_api", "args": {"method": "GET", "path": "/items/", "auth": false}}
+   Note: method and path are required. body and auth are optional. auth defaults to true.
+   Use auth=false to test unauthenticated access (e.g., check 401/403 responses).
 
 To answer questions:
-1. First use list_files to discover relevant wiki files
-2. Then use read_file to read specific files
-3. Find the answer and identify the specific section
-4. Return the final answer with a source reference
+- For wiki/documentation questions: use list_files to discover wiki files, then read_file
+- For source code questions: use list_files on backend/app/routers, then read_file on specific files
+- For data queries (item count, scores): use query_api with GET
+- For HTTP status codes: use query_api with auth=false to see 401/403
+- For API error diagnosis: use query_api to see the error, then read_file to find the bug
+
+Common paths:
+- wiki/ - Project documentation
+- backend/app/routers/ - API router modules (items.py, analytics.py, etc.)
+- backend/app/ - Main application code
+- backend/app/etl.py - ETL pipeline code
+- docker-compose.yml - Docker configuration
 
 IMPORTANT: Always respond with valid JSON.
 
@@ -334,7 +483,7 @@ To call a tool, respond with:
 For the final answer, respond with:
 {"answer": "your answer", "source": "wiki/file.md#section"}
 
-The section anchor should be the heading text in lowercase with spaces replaced by hyphens."""
+The source is optional for system questions. For wiki questions, include the section anchor."""
 
     # Initialize conversation
     messages: list[dict[str, str]] = [
@@ -369,7 +518,11 @@ The section anchor should be the heading text in lowercase with spaces replaced 
             print(f"Executing tool: {tool_name} with args: {args}", file=sys.stderr)
 
             # Execute the tool
-            result = execute_tool(tool_name, args)
+            # For query_api, pass the API credentials
+            if tool_name == "query_api":
+                result = execute_query_api_with_auth(args, lms_api_key, api_base_url)
+            else:
+                result = execute_tool(tool_name, args)
 
             # Log the tool call
             tool_calls_log.append({
@@ -414,6 +567,16 @@ The section anchor should be the heading text in lowercase with spaces replaced 
     return answer, source, tool_calls_log
 
 
+def execute_query_api_with_auth(args: dict[str, Any], lms_api_key: str, api_base_url: str) -> str:
+    """Execute query_api tool with proper authentication."""
+    method = args.get("method", "GET")
+    path = args.get("path", "")
+    body = args.get("body")
+    auth = args.get("auth", True)  # Default to True for backward compatibility
+    
+    return tool_query_api(method, path, body, auth, lms_api_key, api_base_url)
+
+
 def extract_source_from_answer(answer: str, tool_calls_log: list[dict[str, Any]]) -> str:
     """Extract or generate a source reference from the answer.
 
@@ -440,18 +603,22 @@ def extract_source_from_answer(answer: str, tool_calls_log: list[dict[str, Any]]
 def main() -> None:
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="LLM-powered documentation agent with tool calling"
+        description="LLM-powered documentation and system agent with tool calling"
     )
     parser.add_argument("question", help="The question to answer")
     args = parser.parse_args()
 
-    # Load configuration
-    env_vars = load_env()
-    api_key, api_base, model = get_llm_config(env_vars)
+    # Load LLM configuration
+    llm_env = load_env()
+    api_key, api_base, model = get_llm_config(llm_env)
+
+    # Load API configuration for query_api
+    docker_env = load_docker_env()
+    lms_api_key, api_base_url = get_api_config(docker_env)
 
     # Run agentic loop
     answer, source, tool_calls = run_agentic_loop(
-        args.question, api_key, api_base, model
+        args.question, api_key, api_base, model, lms_api_key, api_base_url
     )
 
     # Output result as JSON
